@@ -1,0 +1,9 @@
+/plots
+/datasets
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.sqlite
+*sandbox*
