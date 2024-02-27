@@ -32,6 +32,7 @@ import GeoInterface as GI
 import ArchGDAL as AG
 using Rasters
 using DimensionalData
+using Serialization
 include("utils.jl")
 include("pixel_operations.jl")
 
@@ -75,13 +76,15 @@ Args:
 - lazy: Whether to open the underlying rasters lazily.
 """
 function extract_pixels_worker(path, chunk, i; lazy = false)
-    res = DataFrame(:tnr => Int32[],
+    res = DataFrame(
+        :tnr => Int32[],
         :enr => Int32[],
         :tree_id => Int32[],
         :ba => Int32[],
         :time => DateTime[],
         :boa => Vector{Int16}[],
-        :qai => UInt16[])
+        :qai => UInt16[]
+        )
     missed_plots = 0
     missed_trees = 0
     for group in chunk
@@ -223,20 +226,10 @@ function add_purity_info!(df, csv_file)
     replace!(bestockung.BestockTypFein, "NULL" => "-1")
     bestockung.type = parse.(Int, bestockung.BestockTypFein)
     select!(bestockung, [:tnr, :enr, :type])
-    bestockung_grouped = groupby(bestockung, [:tnr, :enr])
-
-    df.is_pure = zeros(Bool, nrow(df))
-    df.is_pure[df.ba .== -1, :] .= true
-
-    df_grouped = groupby(df, [:tnr, :enr])
-
-    for grp in df_grouped
-        tnr, enr = first(grp.tnr), first(grp.enr)
-        # skip if enr is negative (non-tree)
-        enr < 0 && continue
-        is_pure = first(bestockung_grouped[(tnr = tnr, enr = enr)].type) % 100 == 0
-        grp.is_pure[:] .= is_pure
-    end
+    leftjoin!(df, bestockung; on=[:tnr, :enr], matchmissing=:equal)
+    df.is_pure = @. (df.type % 100) == 0
+    df.is_pure[df.tree_id .< 0 .|| ismissing.(df.is_pure)] .= true
+    select!(df, Not(:type))
 end
 
 """
@@ -257,6 +250,72 @@ function train_test_partition!(df::AbstractDataFrame; train_split = 0.7)
     end
 end
 
+
+"""
+    obfuscate_boa!(df)
+
+Obfuscates the BOA values in the DataFrame by multiplying them with a 
+random number between 0.95 and 1.05.
+"""
+function obfuscate_boa!(df)
+    df.boa = map(x -> round.(Int16, clamp.(x .* (0.95 .+ rand(10) .* 0.1), typemin(Int16), typemax(Int16))), df.boa)
+end
+
+function obfuscate_time!(df)
+    dt = rand(Day.(-3:3), nrow(df))
+    df.time .+= dt
+end
+
+function attach_dbh_height_area!(df, tree_data)
+    leftjoin!(df, unique(view(tree_data, :, [:tree_id, :bhd, :hoehe, :crown_area])); on=:tree_id)
+    rename!(df, :bhd => :dbh, :hoehe => :height)
+    replace!(df.dbh, missing => 0)
+    replace!(df.height, missing => 0)
+    replace!(df.crown_area, missing => 0)
+end
+
+
+# 1km inspire grid
+function attach_inspire_grid_coords_and_rtk!(df, path)
+    data = CSV.read(path, DataFrame)
+    replace.(data.X_WGS84, "," => ".")
+    replace.(data.Y_WGS84, "," => ".")
+    map!(x -> replace(x, "," => "."), data.X_WGS84, data.X_WGS84)
+    map!(x -> replace(x, "," => "."), data.Y_WGS84, data.Y_WGS84)
+    data.X_WGS84 = map(x -> parse(Float32, x), data.X_WGS84)
+    data.Y_WGS84 = map(x -> parse(Float32, x), data.Y_WGS84)
+    rename!(data, :Tnr => :tnr, :Enr => :enr)
+    leftjoin!(df, data; on=[:tnr, :enr], matchmissing=:equal)
+    df.is_corrected[df.ba .== -1] .= true
+end
+
+
+function Base.getindex(r::Raster, pt::AG.IGeometry{AG.wkbPoint})
+    x, y = GI.getcoord(pt)
+    return r[X(Near(x)), Y(Near(y))]
+end
+
+
+function attach_disturbance_info(df, tree_data, disturbance_file_path)
+    lookup = DataFrames.combine(groupby(tree_data[!, [:tnr, :enr, :geom]], [:tnr, :enr]), first)
+    r = Raster(disturbance_file_path)
+    repr = warp(r,
+        Dict(
+            :s_srs => convert(WellKnownText, EPSG(3035)).val,
+            :t_srs => convert(WellKnownText, EPSG(25832)).val,
+            ))
+    lookup.disturbance_year = [Int32(repr[pt]) for pt in lookup.geom]
+    lookup.disturbance_year[lookup.disturbance_year .== 65535] .= 0
+    leftjoin!(df, lookup, on = [:tnr, :enr], matchmissing = :equal)
+    select!(df, Not(:geom))
+end
+
+
+function attach_continuity_info!(df, tree_data)
+    leftjoin!(df, unique(@view tree_data[!, [:tree_id, :present_2022]]); on=:tree_id)
+end
+
+
 """
     main()
 
@@ -265,11 +324,14 @@ Generates the training dataset.
 function main()
     # args = parse_commandline()
 
-    outfile = "dataset_V0.sqlite"
+    outfile = "dataset.sqlite"
     nonforest_points = "datasets/nonforest_pixels.sqlite"
     s2_cutout_path = "/data_local_ssd/bwi/cutouts_2023/"
+    # s2_cutout_path = "/data_ssd/bwi/cutouts_2023/"
     purity_info_csv = "/data_hdd/bwi/bwi2012_bestockung.csv"
-
+    inspire_csv = "/home/max/dr/extract_sentinel_pixels/bwi_inspire.csv"
+    disturbance_file_path = "/data_hdd/forest_disturbance_map_germany/disturbance_year_1986-2020_germany.tif"
+    
     # outfile = args["output"]
     # nonforest_points = args["nonforest-points"]
     # s2_cutout_path = args["tile-folder"]
@@ -287,10 +349,13 @@ function main()
         flags = AG.OF_READONLY | AG.OF_VERBOSE_ERROR | AG.OF_VECTOR)
 
     # takes ~100s
-    tree_data_raw = executesql(conn,
-        "select * from geo.persistent_trees_matview where bhd>200 and bs!=2 and hoehe>120")
-    # throw out trees without attached geometry
-    tree_data = tree_data_raw[.!ismissing.(tree_data_raw.geom), :]
+    # tree_data = executesql(conn,
+    #     "select * from geo.persistent_trees_matview where bs!=2")
+    tree_data = executesql(conn, "select * from geo.trees_2012_matview")
+    unique!(tree_data)
+    rename!(tree_data, :pk_2022 => :present_2022)
+    tree_data.crown_area = Float32.(AG.geomarea.(tree_data.geom_sfl))
+    tree_data.present_2022[ismissing.(tree_data.present_2022)] .= false
 
     # widen the type of geom_sfl to include missings, that we add further down
     tree_data.geom_sfl = Vector{Union{eltype(tree_data.geom_sfl), Missing}}(tree_data.geom_sfl)
@@ -304,27 +369,47 @@ function main()
     rename!(non_tree_coords, :plot_id => :tnr, :GEOMETRY => :geom)
     for r in eachrow(non_tree_coords)
         push!(tree_data,
-            (r.geom, missing, r.tree_id, -1, r.tnr, -1, -1, -1, -1, -1, -1, "", "", 0))
+            (r.geom, missing, r.tree_id, r.tnr, -1, -1, -1, 0, 0, true, 0))
     end
     println("Nonforest info added")
 
-    # tree_data = @view tree_data[1:1000:end, :]
+    # tree_data = @view tree_data[1:2400:end, :]
 
     # group df by cluster plot id (tnr) and extract the pixels
     grouped_df = groupby(tree_data, :tnr)
     @time res = extract_pixels(s2_cutout_path, grouped_df)
 
-    println("Adding purity info")
+    # restrict data to 2022
+    res = res[res.time .< DateTime(2022,10,31), :]
+
+    println("Adding other info...")
     @time add_purity_info!(res, purity_info_csv)
-    println("Splitting train / test")
     @time train_test_partition!(res; train_split = 0.7)
+    @time obfuscate_boa!(res)
+    @time obfuscate_time!(res)
+    @time attach_dbh_height_area!(res, tree_data)
+    @time attach_inspire_grid_coords_and_rtk!(res, inspire_csv)
+    @time attach_disturbance_info(res, tree_data, disturbance_file_path)
+    @time attach_continuity_info!(res, tree_data)
 
-    select!(res, Not([:tnr, :enr]))
+    select!(res, Not([:cell_id]))
+    rename!(res, :ba => :species)
+    rename!(res, :dbh => :dbh_mm)
+    rename!(res, :height => :height_dm)
+    rename!(res, :crown_area => :crown_area_m2)
 
-    prepare_df_dtypes_for_export!(res)
+    # throw away rows with missing qai and ensure uniqueness
+    res = res[.!ismissing.(res.qai), :]
+    unique!(res)
+    
     println("Writing result")
+    @time serialize(splitext(outfile)[1] * ".jls110", res)
+    
+    prepare_df_dtypes_for_export!(res)
     @time write_sqlite(outfile, res)
     println("Done")
+    return res
 end
 
-main()
+#%%
+@time res = main()

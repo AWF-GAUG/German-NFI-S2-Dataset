@@ -123,14 +123,22 @@ function prepare_df_dtypes_for_export!(df)
         df.boa = map(vec2blob, df.boa)
     end
     if !("doy" in names(df))
-        df.doy = Int32.(dayofyear.(df.time))
+        df.doy = dayofyear.(df.time)
     end
     if eltype(df.time) <: DateTime
-        # remember to update this before 2038 ;-)
-        df.time = Int32.(datetime2unix.(df.time))
+        df.time = datetime2unix.(df.time)
     end
+    df.tnr = Int32.(df.tnr)
     df.tree_id = Int32.(df.tree_id)
+    df.species = Int32.(df.species)
+    df.time = Int32.(df.time)
+    df.doy = Int32.(df.doy)
     df.qai = Int32.(df.qai)
+    df.dbh_mm = Int32.(df.dbh_mm)
+    df.height_dm = Int32.(df.height_dm)
+    df.crown_area_m2 = Float32.(df.crown_area_m2)
+    df.is_train = Bool.(df.is_train)
+    df.is_pure = Bool.(df.is_pure)
     return df
 end
 
