@@ -219,7 +219,7 @@ Reads a CSV containing info on whether a subplot is pure or not and
 attaches this info on DataFrame df. `tree_data` is the raw DataFrame 
 containing the tree positions and subplot ids.
 """
-function add_purity_info!(df, csv_file)
+function attach_purity_info!(df, csv_file)
     bestockung = CSV.read(csv_file, DataFrame)
     rename!(bestockung, :Tnr => :tnr)
     rename!(bestockung, :Enr => :enr)
@@ -383,10 +383,10 @@ function main()
     res = res[res.time .< DateTime(2022,10,31), :]
 
     println("Adding other info...")
-    @time add_purity_info!(res, purity_info_csv)
-    @time train_test_partition!(res; train_split = 0.7)
     @time obfuscate_boa!(res)
     @time obfuscate_time!(res)
+    @time train_test_partition!(res; train_split = 0.7)
+    @time attach_purity_info!(res, purity_info_csv)
     @time attach_dbh_height_area!(res, tree_data)
     @time attach_inspire_grid_coords_and_rtk!(res, inspire_csv)
     @time attach_disturbance_info(res, tree_data, disturbance_file_path)

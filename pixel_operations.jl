@@ -56,12 +56,19 @@ Args:
 """
 function weighted_mean_pixel_value(polygon, pixel_coords, pixel_polygons, raster)
     pa = AG.geomarea(polygon)
-    res = eltype(raster).(zero(@view raster[1, 1, :]))
+    res = zeros(Float32, 10)
     for (coord, pixel) in zip(pixel_coords, pixel_polygons)
-        pixel_weight = AG.geomarea(AG.intersection(polygon, pixel)) / pa
         x, y = coord
         pixel_value = @view raster[X(Near(x)), Y(Near(y))]
+        
+        # return nodata if there's a nodata pixel in the area
+        if pixel_value[1] == -9999
+            res[:] .= -9999
+            return Int16.(res)
+        end
+        
+        pixel_weight = AG.geomarea(AG.intersection(polygon, pixel)) / pa
         res += pixel_value * pixel_weight
     end
-    return round.(eltype(raster), res)
+    return round.(Int16, res)
 end
