@@ -59,11 +59,11 @@ function weighted_mean_pixel_value(polygon, pixel_coords, pixel_polygons, raster
     res = zeros(Float32, 10)
     for (coord, pixel) in zip(pixel_coords, pixel_polygons)
         x, y = coord
-        pixel_value = @view raster[X(Near(x)), Y(Near(y))]
+        pixel_value = raster[X(Near(x)), Y(Near(y))]
         
         # return nodata if there's a nodata pixel in the area
         if pixel_value[1] == -9999
-            res[:] .= -9999
+            res .= -9999
             return Int16.(res)
         end
         

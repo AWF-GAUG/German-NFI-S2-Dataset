@@ -25,6 +25,7 @@ using Statistics
 using Serialization
 using ForceCubeAccess
 using Dates
+using Random
 using CSV
 using Base.Threads
 using Base.Threads: atomic_add!
@@ -33,8 +34,10 @@ import ArchGDAL as AG
 using Rasters
 using DimensionalData
 using Serialization
+using Parquet2
 include("utils.jl")
 include("pixel_operations.jl")
+
 
 function parse_commandline()
     s = ArgParseSettings()
@@ -121,7 +124,7 @@ function extract_pixels_worker(path, chunk, i; lazy = false)
         xmin_global, ymin_global = minimum.(dims(sr, (X, Y)))
         xstep, ystep = step.(dims(sr, (X, Y)))
 
-        corner_groups = groupby(group, :enr)
+        corner_groups = DataFrames.groupby(group, :enr)
 
         for corner in corner_groups
             enr = first(corner.enr)
@@ -198,7 +201,7 @@ function extract_pixels(path, df)
         Threads.@spawn extract_pixels_worker(path, chunk, i)
     end
 
-    while i[] < length(df)
+    while i[] < length(df) && any(t -> !istaskdone(t), tasks)
         sleep(5)
         increment = i[] - last_i
         last_i = i[]
@@ -216,7 +219,7 @@ end
     add_purity_info!(df, csv_file)
 
 Reads a CSV containing info on whether a subplot is pure or not and 
-attaches this info on DataFrame df. `tree_data` is the raw DataFrame 
+attaches this info on DataFrame df. `df` is the raw DataFrame 
 containing the tree positions and subplot ids.
 """
 function attach_purity_info!(df, csv_file)
@@ -241,9 +244,11 @@ plot id as column with name tnr - records are assigned to train or test
 based on cluster plot id.
 """
 function train_test_partition!(df::AbstractDataFrame; train_split = 0.7)
+    # fixed seed does not 100% ensure reproducibility!
+    rng = Xoshiro(42)
     df.is_train = fill(Bool(0), nrow(df))
-    tnr_groups = groupby(df, :tnr)
-    is_train = rand(length(tnr_groups)) .< train_split
+    tnr_groups = DataFrames.groupby(df, :tnr)
+    is_train = rand(rng, length(tnr_groups)) .< train_split
 
     for (i, g) in enumerate(tnr_groups)
         g.is_train[:] .= is_train[i]
@@ -258,11 +263,13 @@ Obfuscates the BOA values in the DataFrame by multiplying them with a
 random number between 0.95 and 1.05.
 """
 function obfuscate_boa!(df)
-    df.boa = map(x -> round.(Int16, clamp.(x .* (0.95 .+ rand(10) .* 0.1), typemin(Int16), typemax(Int16))), df.boa)
+    rng = Xoshiro(42)
+    df.boa = map(x -> round.(Int16, clamp.(x .* (0.95 .+ rand(rng, 10) .* 0.1), typemin(Int16), typemax(Int16))), df.boa)
 end
 
 function obfuscate_time!(df)
-    dt = rand(Day.(-3:3), nrow(df))
+    rng = Xoshiro(42)
+    dt = rand(rng, Day.(-3:3), nrow(df))
     df.time .+= dt
 end
 
@@ -297,7 +304,7 @@ end
 
 
 function attach_disturbance_info(df, tree_data, disturbance_file_path)
-    lookup = DataFrames.combine(groupby(tree_data[!, [:tnr, :enr, :geom]], [:tnr, :enr]), first)
+    lookup = DataFrames.combine(DataFrames.groupby(tree_data[!, [:tnr, :enr, :geom]], [:tnr, :enr]), first)
     r = Raster(disturbance_file_path)
     repr = warp(r,
         Dict(
@@ -316,6 +323,13 @@ function attach_continuity_info!(df, tree_data)
 end
 
 
+function retrofit_train_test_from_other_dataset!(df)
+    other_df = Parquet2.Dataset("datasets/S2GNFI_V1.parquet") |> Parquet2.select(:tree_id, :is_train) |> DataFrame
+    unique!(other_df, :tree_id)
+    leftjoin!(df, other_df; on=:tree_id)
+end
+
+
 """
     main()
 
@@ -324,7 +338,7 @@ Generates the training dataset.
 function main()
     # args = parse_commandline()
 
-    outfile = "dataset.sqlite"
+    output_filename = "dataset"
     nonforest_points = "datasets/nonforest_pixels.sqlite"
     s2_cutout_path = "/data_local_ssd/bwi/cutouts_2023/"
     # s2_cutout_path = "/data_ssd/bwi/cutouts_2023/"
@@ -339,8 +353,8 @@ function main()
     # db = args["pg-database"]
     db = ENV["PG_DATABASE"]
 
-    if isfile(outfile)
-        error("Output file $outfile exists. Please provide a different output file name.")
+    if isfile(output_filename * ".sqlite") || isfile(output_filename * ".parquet")
+        error("Output file $output_filename.(sqlite|parquet) exists. Please provide a different output file name.")
     end
 
     println("Loading data from postgres")
@@ -349,8 +363,6 @@ function main()
         flags = AG.OF_READONLY | AG.OF_VERBOSE_ERROR | AG.OF_VECTOR)
 
     # takes ~100s
-    # tree_data = executesql(conn,
-    #     "select * from geo.persistent_trees_matview where bs!=2")
     tree_data = executesql(conn, "select * from geo.trees_2012_matview")
     unique!(tree_data)
     rename!(tree_data, :pk_2022 => :present_2022)
@@ -376,7 +388,7 @@ function main()
     # tree_data = @view tree_data[1:2400:end, :]
 
     # group df by cluster plot id (tnr) and extract the pixels
-    grouped_df = groupby(tree_data, :tnr)
+    grouped_df = DataFrames.groupby(tree_data, :tnr)
     @time res = extract_pixels(s2_cutout_path, grouped_df)
 
     # restrict data to 2022
@@ -386,6 +398,7 @@ function main()
     @time obfuscate_boa!(res)
     @time obfuscate_time!(res)
     @time train_test_partition!(res; train_split = 0.7)
+    # @time retrofit_train_test_from_other_dataset!(res)
     @time attach_purity_info!(res, purity_info_csv)
     @time attach_dbh_height_area!(res, tree_data)
     @time attach_inspire_grid_coords_and_rtk!(res, inspire_csv)
@@ -403,10 +416,11 @@ function main()
     unique!(res)
     
     println("Writing result")
-    @time serialize(splitext(outfile)[1] * ".jls110", res)
+    @time serialize(output_filename * ".jls110", res)
     
     prepare_df_dtypes_for_export!(res)
-    @time write_sqlite(outfile, res)
+    @time write_sqlite(output_filename * ".sqlite", res)
+    @time Parquet2.writefile(output_filename * ".parquet", res)
     println("Done")
     return res
 end
